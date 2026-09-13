@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
 
@@ -33,6 +34,18 @@ public abstract class Source
 
     /// <summary>悬停附加行（低优先级，如 Token），超长时先裁剪</summary>
     public virtual IReadOnlyList<string> TooltipExtrasLow => [];
+
+    /// <summary>悬停空间不足时，该源是否可压缩为单行（仅显示最关键窗口）</summary>
+    public virtual bool CompactWhenCrowded => false;
+
+    /// <summary>压缩模式下的单行（默认取最后一个窗口，通常是月/总）</summary>
+    public virtual string CompactLine()
+    {
+        if (Error is not null) return $"{Name}: 出错";
+        if (Items.Count == 0) return $"{Name}: 无数据";
+        var (lb, u, q) = Items[^1];
+        return $"{Name} {lb}: {Fmt.Num(u)}/{Fmt.Num(q)}{(q > 0 ? $" {u / q * 100:0}%" : "")}";
+    }
 
     public List<string> TooltipLines()
     {
@@ -370,6 +383,26 @@ public sealed class ArkAFPSource : Source
         ResetTimes = resets;
         var cd = Fmt.Countdown(resets.GetValueOrDefault("月"));
         ExtraLines = cd is null ? [] : [$"月额度{cd}"];
+
+        // 本月 Token 用量（套餐调用明细口径）
+        await FetchMonthTokensAsync();
+    }
+
+    public const string ApiInferenceUsage =
+        "https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetInferenceUsage?";
+
+    /// <summary>本月 Token 总用量（输入+输出）</summary>
+    public double? MonthTokens { get; private set; }
+    public string? MonthTokenLine { get; private set; }
+
+    internal async Task FetchMonthTokensAsync()
+    {
+        // AgentPlan 套餐 Token 用 GetSeatUsageDetails 管道（plan-details），非 GetInferenceUsage
+        var total = await ArkMonthTokens.FetchAsync("agent-plan-team");
+        MonthTokens = total;
+        // 面板用完整行；悬停用短格式（托盘 127 字符预算有限）
+        MonthTokenLine = $"本月Token: {Fmt.Num(total)}";
+        ExtraLines = [.. ExtraLines, $"本月Token {Fmt.Num(total)}"];
     }
 
     private static (JsonElement? json, JsonElement? error) Unwrap(JsonElement res)
@@ -386,4 +419,183 @@ public sealed class ArkAFPSource : Source
         => Items.FirstOrDefault(it => it.Label == "月" && it.Quota > 0) is { } it ? (it.Label, it.Used, it.Quota) : null;
 
     public override string? HistoryLabel() => "月";
+}
+
+// ---------------- 火山方舟 AgentPlan（arkcli 数据源） ----------------
+/// <summary>通过 arkcli usage plan 查询套餐 quota 快照；不依赖内置浏览器，走 arkcli 自己的登录态</summary>
+public sealed class ArkCliSource : Source
+{
+    private readonly string _product;
+    private readonly BrowserSession _session;
+
+    public ArkCliSource(SourceConfig cfg, BrowserSession session)
+        : base(string.IsNullOrWhiteSpace(cfg.Name) ? "方舟CLI" : cfg.Name)
+    {
+        _product = string.IsNullOrWhiteSpace(cfg.Cookie) ? "agent-plan-team" : cfg.Cookie.Trim();
+        _session = session;
+    }
+
+    /// <summary>与方舟AFP 数据同源重复，悬停拥挤时压缩为单行，完整数据看面板</summary>
+    public override bool CompactWhenCrowded => true;
+
+    public override string CompactLine()
+    {
+        if (Error is not null) return $"{Name}: 出错({Error})";
+        if (Items.FirstOrDefault(it => it.Label == "月") is { } m)
+            return $"{Name} 月: {Fmt.Num(m.Used)}/{Fmt.Num(m.Quota)} {(m.Quota > 0 ? m.Used / m.Quota * 100 : 0):0}%";
+        return base.CompactLine();
+    }
+
+    public override async Task FetchAsync()
+    {
+        var (json, err) = await ArkCli.RunAsync("usage", "plan", "--product", _product);
+        if (json is null) throw new Exception("arkcli: " + err);
+
+        var item = json.Value.GetProperty("items").EnumerateArray().FirstOrDefault();
+        if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("subscribed", out var sub)
+            || !sub.GetBoolean())
+            throw new Exception("arkcli: 未订阅 " + _product);
+
+        var items = new List<(string Label, double Used, double Quota)>();
+        var resets = new Dictionary<string, double?>();
+        foreach (var p in item.GetProperty("periods").EnumerateArray())
+        {
+            var label = p.TryGetProperty("label", out var l) ? l.GetString() ?? "" : "";
+            var used = p.TryGetProperty("used", out var u) ? u.GetDouble() : 0;
+            var total = p.TryGetProperty("total", out var t) ? t.GetDouble() : 0;
+            // CodingPlan 只有 percent，无 used/total
+            if (total <= 0 && p.TryGetProperty("percent", out var pc))
+            {
+                var pct = pc.GetDouble();
+                items.Add((label, pct, 100));
+                resets[label] = null;
+                continue;
+            }
+            if (total <= 0) continue;
+            var map = label switch { "5h" => "5h", "weekly" => "周", "monthly" => "月", _ => label };
+            items.Add((map, used, total));
+            resets[map] = p.TryGetProperty("reset_at", out var r) && r.GetString() is { } s
+                ? (double?)(DateTimeOffset.Parse(s).ToUnixTimeMilliseconds())
+                : null;
+        }
+        Error = null;
+        Items = items;
+        ResetTimes = resets;
+        var cd = Fmt.Countdown(resets.GetValueOrDefault("月"));
+        ExtraLines = cd is null ? [] : [$"月额度{cd}"];
+
+        // 本月 Token 用量（与方舟AFP 同口径：套餐调用明细 GetSeatUsageDetails）
+        var mt = await ArkMonthTokens.FetchAsync(_product);
+        MonthTokens = mt;
+        MonthTokenLine = $"本月Token: {Fmt.Num(mt)}";
+        ExtraLines = [.. ExtraLines, $"本月Token {Fmt.Num(mt)}"];
+    }
+
+    /// <summary>本月 Token 总用量（输入+输出）</summary>
+    public double? MonthTokens { get; private set; }
+    public string? MonthTokenLine { get; private set; }
+
+    public override (string, double, double)? HistoryRow()
+        => Items.FirstOrDefault(it => it.Label == "月" && it.Quota > 0) is { } it ? (it.Label, it.Used, it.Quota) : null;
+
+    public override string? HistoryLabel() => "月";
+}
+
+/// <summary>
+/// 本月套餐 Token 统计。
+/// 注意：必须用 arkcli usage plan-details（底层 GetSeatUsageDetails，套餐调用明细）——
+/// GetInferenceUsage 是按量付费管道，AgentPlan 套餐调用只返回异常行，正常消耗完全不在其中。
+/// </summary>
+internal static class ArkMonthTokens
+{
+    public static async Task<double> FetchAsync(string product)
+    {
+        try
+        {
+            var monthStart = DateTime.Now.AddDays(-(DateTime.Now.Day - 1)).ToString("yyyy-MM-dd");
+            var (json, err) = await ArkCli.RunAsync("usage", "plan-details",
+                "--product", product, "--start", monthStart);
+            if (json is null)
+            {
+                Log.Warn("[方舟] 本月Token统计失败: {0}", err ?? "unknown");
+                return 0;
+            }
+            double total = 0;
+            if (json.Value.TryGetProperty("details", out var details)
+                && details.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var d in details.EnumerateArray())
+                {
+                    var unit = d.TryGetProperty("unit", out var u) ? u.GetString() : null;
+                    if (!string.Equals(unit, "Tokens", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (d.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Number)
+                        total += usage.GetDouble();
+                }
+            }
+            Log.Info("[方舟] 本月Token(plan-details): {0:N0}", total);
+            return total;
+        }
+        catch (Exception e)
+        {
+            Log.Warn("[方舟] 本月Token统计失败: {0}", e.Message);
+            return 0;
+        }
+    }
+}
+
+/// <summary>arkcli 命令行封装</summary>
+public static class ArkCli
+{
+    /// <summary>定位 arkcli 可执行文件：npm 全局安装通常是 arkcli.cmd，Process.Start 无法自动解析</summary>
+    private static readonly Lazy<string?> ExePath = new(() =>
+    {
+        var exts = (Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            foreach (var ext in exts)
+            {
+                var p = Path.Combine(dir.Trim(), "arkcli" + ext.ToLower());
+                if (File.Exists(p)) return p;
+            }
+            var bare = Path.Combine(dir.Trim(), "arkcli");
+            if (File.Exists(bare)) return bare;
+        }
+        return null;
+    });
+
+    public static async Task<(JsonElement? json, string? error)> RunAsync(params string[] args)
+    {
+        var exe = ExePath.Value
+            ?? throw new Exception("未找到 arkcli（请先安装: npm i -g @volcengine/ark-cli）");
+        var psi = new ProcessStartInfo(exe)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        psi.EnvironmentVariables["ARKCLI_NO_UPDATE_NOTIFIER"] = "1";
+        psi.EnvironmentVariables["ARKCLI_CALLER_TYPE"] = "ai_agent";
+        psi.EnvironmentVariables["ARKCLI_CALLER_NAME"] = "trae-usage-tray";
+        psi.EnvironmentVariables["ARKCLI_SKILL_NAME"] = "arkcli-usage";
+
+        using var p = Process.Start(psi)
+            ?? throw new Exception("无法启动 arkcli（请确认已安装: npm i -g @volcengine/ark-cli）");
+        var outs = await p.StandardOutput.ReadToEndAsync();
+        var errs = await p.StandardError.ReadToEndAsync();
+        await p.WaitForExitAsync();
+
+        if (p.ExitCode != 0)
+            return (null, (errs.Length > 0 ? errs : outs) is { } m && m.Length > 0 ? m[..Math.Min(120, m.Length)] : $"exit {p.ExitCode}");
+        try
+        {
+            return (JsonDocument.Parse(outs).RootElement.Clone(), null);
+        }
+        catch
+        {
+            return (null, "输出非 JSON: " + outs[..Math.Min(80, outs.Length)]);
+        }
+    }
 }

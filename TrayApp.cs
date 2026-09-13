@@ -18,6 +18,7 @@ public sealed class TrayApp : IDisposable
     private readonly CancellationTokenSource _stop = new();
     private Icon? _currentIcon;
     private ToolStripMenuItem? _iconMenu;
+    private HoverTip? _hover;
 
     public TrayApp()
     {
@@ -61,6 +62,9 @@ public sealed class TrayApp : IDisposable
         {
             if (e.Button == MouseButtons.Left) OpenPanel();
         };
+        // 悬停展示全量信息：自绘悬浮窗，突破系统 tooltip 127 字符限制。
+        // NotifyIcon 无 MouseHover 事件，用 MouseMove 触发；悬浮窗可见时直接跳过，无重复开销
+        _icon.MouseMove += (_, _) => ShowHover();
 
         _ = Task.Run(RunLoopAsync);
     }
@@ -88,6 +92,9 @@ public sealed class TrayApp : IDisposable
                     break;
                 case "ark_afp":
                     _sources.Add(new ArkAFPSource(sc, _sessions["ark"]));
+                    break;
+                case "ark_cli":
+                    _sources.Add(new ArkCliSource(sc, _sessions["ark"]));
                     break;
             }
         }
@@ -235,6 +242,22 @@ public sealed class TrayApp : IDisposable
         }
     }
 
+    // ---- 悬停悬浮窗 ----
+    private void ShowHover()
+    {
+        try
+        {
+            _hover ??= new HoverTip();
+            if (_hover.Visible) return;
+            _icon.Text = "";   // 屏蔽系统 tooltip，避免与自绘窗重叠；悬浮窗隐藏后由下次刷新恢复
+            _hover.ShowAt(Cursor.Position, BuildTooltip(true, true, true));
+        }
+        catch (Exception e)
+        {
+            Log.Warn("悬停显示失败: {0}", e.Message);
+        }
+    }
+
     // ---- 刷新循环 ----
     private async Task RunLoopAsync()
     {
@@ -345,31 +368,49 @@ public sealed class TrayApp : IDisposable
         }, null);
     }
 
-    private void UpdateUi()
+    /// <summary>拼接多源悬停文本。extras=重置倒计时/Token 附加行，low=低量预警行，updated=更新时间，compact=所有源压成单行</summary>
+    private string BuildTooltip(bool extras, bool low, bool updated, bool compact = false)
     {
-        string Join(bool extras, bool low, bool updated)
+        var ls = new List<string>();
+        foreach (var s in _sources)
         {
-            var ls = new List<string>();
-            foreach (var s in _sources)
+            if (ls.Count > 0) ls.Add("");
+            if (compact)
             {
-                if (ls.Count > 0) ls.Add("");   // 源之间空行分段
+                // 拥挤兜底：所有源压成单行（总/月窗口），仍保留附加信息（重置倒计时、Token）；
+                // 可压缩源（数据与主源重复）跳过附加信息，避免重复占用预算
+                ls.Add(s.CompactLine());
+                if (s.CompactWhenCrowded) continue;
+                if (extras) ls.AddRange(s.TooltipExtras);
+                if (low) ls.AddRange(s.TooltipExtrasLow);
+            }
+            else
+            {
                 ls.AddRange(s.TooltipLines());
                 if (extras) ls.AddRange(s.TooltipExtras);
                 if (low) ls.AddRange(s.TooltipExtrasLow);
             }
-            if (updated && _lastOk is { } t)
-            {
-                ls.Add("");
-                ls.Add("更新于 " + t.ToString("HH:mm:ss"));
-            }
-            return string.Join("\n", ls);
         }
+        if (updated && _lastOk is { } t)
+        {
+            ls.Add("");
+            ls.Add("更新于 " + t.ToString("HH:mm:ss"));
+        }
+        return string.Join("\n", ls);
+    }
 
-        // 托盘 127 字符上限：超长时依次裁掉"更新于"、Token 行、重置倒计时，用量行永不截断
-        var text = Join(true, true, true);
-        if (text.Length > 127) text = Join(true, true, false);
-        if (text.Length > 127) text = Join(true, false, false);
-        if (text.Length > 127) text = Join(false, false, false);
+    private void UpdateUi()
+    {
+        // 悬浮窗全量文本（无长度限制）
+        var full = BuildTooltip(true, true, true);
+
+        // 托盘 127 字符上限：超长时依次裁掉"更新于"、Token 行、重置倒计时；最后全源压成单行再试，用量行永不截断
+        var text = full;
+        if (text.Length > 127) text = BuildTooltip(true, true, false);
+        if (text.Length > 127) text = BuildTooltip(true, false, false);
+        if (text.Length > 127) text = BuildTooltip(false, false, false);
+        if (text.Length > 127) text = BuildTooltip(true, true, false, compact: true);
+        if (text.Length > 127) text = BuildTooltip(false, false, false, compact: true);
         if (text.Length > 127) text = text[..127];
         var err = _sources.Any(s => s.Error is not null);
         var pct = IconPct();
@@ -381,7 +422,15 @@ public sealed class TrayApp : IDisposable
         {
             try
             {
-                _icon.Text = text;
+                if (_hover is { Visible: true } h)
+                {
+                    // 悬浮窗开着：同步刷新全量内容，不写系统 tooltip（保持屏蔽状态）
+                    h.UpdateText(full);
+                }
+                else
+                {
+                    _icon.Text = text;
+                }
                 _currentIcon?.Dispose();
                 _currentIcon = IconFactory.Make(pct, err, _cfg.IconShowPct);
                 _icon.Icon = _currentIcon;
@@ -441,6 +490,7 @@ public sealed class TrayApp : IDisposable
     {
         _stop.Cancel();
         _web.Stop();
+        _hover?.Dispose();
         _icon.Dispose();
         _currentIcon?.Dispose();
     }

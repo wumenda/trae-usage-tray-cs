@@ -117,6 +117,8 @@ public sealed class WebPanel
                 return cd is null ? null : $"{it.Label}额度{cd}";
             }).ToArray(),
             token = (s as TraeSource)?.TokenLine,
+            month_token = (s as ArkAFPSource)?.MonthTokenLine
+                          ?? (s as ArkCliSource)?.MonthTokenLine,
             history = new
             {
                 label = s.HistoryLabel() ?? "",

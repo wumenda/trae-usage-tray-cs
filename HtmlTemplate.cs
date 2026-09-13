@@ -322,6 +322,7 @@ function render() {
           '<div class="progress"><div class="bar ' + barClass(p) + '" style="width:' + p + '%"></div></div>';
       }).join('') +
         (s.token ? '<div class="note">' + esc(s.token) + '</div>' : '') +
+        (s.month_token ? '<div class="note">' + esc(s.month_token) + '</div>' : '') +
         (s.resets ? s.resets.filter(Boolean).map(r =>
           '<div class="note">' + esc(r) + '</div>').join('') : '');
     }
