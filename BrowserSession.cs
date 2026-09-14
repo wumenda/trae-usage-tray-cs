@@ -129,11 +129,20 @@ public sealed class BrowserSession
                 return;
             }
 
-            // 尝试注入持久化 cookie（session cookie 重启后会丢）
-            if (await InjectCookiesAsync() && await LoggedInAsync())
+            // 尝试注入持久化 cookie（session cookie 重启后会丢）。
+            // 刚重启的浏览器页面/WAF 可能尚未就绪导致校验瞬时失败，重试几次再下结论
+            if (await InjectCookiesAsync())
             {
-                Log.Info("[{0}] 持久化 cookie 注入成功", Tag);
-                return;
+                for (var i = 0; i < 3; i++)
+                {
+                    if (await LoggedInAsync())
+                    {
+                        Log.Info("[{0}] 持久化 cookie 注入成功", Tag);
+                        return;
+                    }
+                    Log.Info("[{0}] 注入后校验未通过({1}/3)，稍后重试", Tag, i + 1);
+                    await Task.Delay(3000);
+                }
             }
 
             // 需要用户登录
@@ -160,7 +169,17 @@ public sealed class BrowserSession
             await Mgr.StartAsync(headless: true, LoginUrl);
             await Mgr.OpenOrNavigateAsync(LoginUrl);
             await InjectCookiesAsync();
-            if (!await LoggedInAsync())
+            var recheck = false;
+            for (var i = 0; i < 3 && !recheck; i++)
+            {
+                recheck = await LoggedInAsync();
+                if (!recheck)
+                {
+                    Log.Info("[{0}] 登录后校验未通过({1}/3)，稍后重试", Tag, i + 1);
+                    await Task.Delay(3000);
+                }
+            }
+            if (!recheck)
             {
                 Mgr.Stop();
                 throw new CdpException($"[{Tag}] 登录后校验失败");

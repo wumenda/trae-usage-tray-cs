@@ -317,11 +317,31 @@ public sealed class ArkAFPSource : Source
     {
         var r = await session.CallApiAsync(ApiSeat,
             new { ProjectName = "default", Scene = "agent_plan_enterprise" });
-        if (!r.TryGetProperty("json", out var j)) return false;
-        return j.TryGetProperty("Result", out var res)
-               && res.ValueKind == JsonValueKind.Object
-               && res.TryGetProperty("SeatID", out var seat)
-               && seat.GetString() is { Length: > 0 };
+        if (!r.TryGetProperty("json", out var j))
+        {
+            // 非 JSON：多半是被 WAF 拦截或重定向到登录页，记录原文便于诊断
+            var text = r.TryGetProperty("text", out var t) ? t.GetString() : null;
+            var status = r.TryGetProperty("status", out var st) ? st.GetInt32() : 0;
+            Log.Info("[方舟] 校验失败: 响应非JSON status={0} text={1}", status,
+                string.IsNullOrEmpty(text) ? "(空)" : text[..Math.Min(120, text.Length)]);
+            return false;
+        }
+        if (j.ValueKind != JsonValueKind.Object) return false;
+        if (j.TryGetProperty("ResponseMetadata", out var meta)
+            && meta.TryGetProperty("Error", out var err) && err.ValueKind == JsonValueKind.Object)
+        {
+            Log.Info("[方舟] 校验失败: {0}: {1}",
+                err.TryGetProperty("Code", out var c) ? c.GetString() ?? "?" : "?",
+                err.TryGetProperty("Message", out var m) ? m.GetString() ?? "?" : "?");
+            return false;
+        }
+        if (j.TryGetProperty("Result", out var res)
+           && res.ValueKind == JsonValueKind.Object
+           && res.TryGetProperty("SeatID", out var seat)
+           && seat.GetString() is { Length: > 0 })
+            return true;
+        Log.Info("[方舟] 校验失败: Result 中无 SeatID: {0}", j.ToString()[..Math.Min(200, j.ToString().Length)]);
+        return false;
     }
 
     public override async Task FetchAsync()
@@ -385,20 +405,59 @@ public sealed class ArkAFPSource : Source
         ExtraLines = cd is null ? [] : [$"月额度{cd}"];
 
         // 本月 Token 用量（套餐调用明细口径）
-        await FetchMonthTokensAsync();
+        await FetchMonthTokensAsync(seatId);
     }
 
     public const string ApiInferenceUsage =
         "https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetInferenceUsage?";
+    public const string ApiSeatUsageDetails =
+        "https://console.volcengine.com/api/top/ark/cn-beijing/2024-01-01/GetSeatUsageDetails?";
 
     /// <summary>本月 Token 总用量（输入+输出）</summary>
     public double? MonthTokens { get; private set; }
     public string? MonthTokenLine { get; private set; }
 
-    internal async Task FetchMonthTokensAsync()
+    /// <summary>
+    /// 本月套餐 Token 统计走浏览器会话（GetSeatUsageDetails，与 arkcli usage plan-details 同一底层 API）。
+    /// 不用 arkcli：arkcli 有独立登录态，若登录的是别的火山账号会报 "no Agent Plan enterprise seat found"。
+    /// </summary>
+    internal async Task FetchMonthTokensAsync(string seatId)
     {
-        // AgentPlan 套餐 Token 用 GetSeatUsageDetails 管道（plan-details），非 GetInferenceUsage
-        var total = await ArkMonthTokens.FetchAsync("agent-plan-team");
+        double total = 0;
+        try
+        {
+            var monthStart = DateTime.Now.AddDays(-(DateTime.Now.Day - 1)).ToString("yyyy-MM-dd");
+            var today = DateTime.Now.ToString("yyyy-MM-dd");
+            var r = await _session.CallApiAsync(ApiSeatUsageDetails, new
+            {
+                Filter = new { StartTime = monthStart, EndTime = today },
+                QueryInterval = "Day",
+                SeatIDs = new[] { seatId },
+            });
+            if (r.TryGetProperty("json", out var j) && j.ValueKind == JsonValueKind.Object
+                && j.TryGetProperty("Result", out var res)
+                && res.TryGetProperty("SeatUsageDetails", out var seats)
+                && seats.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var seat in seats.EnumerateArray())
+                {
+                    if (!seat.TryGetProperty("Details", out var details)
+                        || details.ValueKind != JsonValueKind.Array) continue;
+                    foreach (var d in details.EnumerateArray())
+                    {
+                        var unit = d.TryGetProperty("Unit", out var un) ? un.GetString() : null;
+                        if (!string.Equals(unit, "Tokens", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (d.TryGetProperty("Usage", out var usage) && usage.ValueKind == JsonValueKind.Number)
+                            total += usage.GetDouble();
+                    }
+                }
+            }
+            Log.Info("[方舟] 本月Token(GetSeatUsageDetails): {0:N0}", total);
+        }
+        catch (Exception e)
+        {
+            Log.Warn("[方舟] 本月Token统计失败: {0}", e.Message);
+        }
         MonthTokens = total;
         // 面板用完整行；悬停用短格式（托盘 127 字符预算有限）
         MonthTokenLine = $"本月Token: {Fmt.Num(total)}";
